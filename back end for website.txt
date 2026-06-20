@@ -1,0 +1,233 @@
+#define BLYNK_TEMPLATE_ID "TMPL3aDjx6TQW"
+#define BLYNK_TEMPLATE_NAME "Accedent"
+#define BLYNK_AUTH_TOKEN "DSYO6_oxCmLU1PNzHhzsB9UCI9qgyQeh"
+
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+#include <Wire.h>
+#include <Adafruit_ADXL345_U.h>
+#include <Adafruit_Sensor.h>
+#include <TinyGPS++.h>
+#include <HardwareSerial.h>
+
+// ===== WIFI =====
+char ssid[] = "Smahi";
+char pass[] = "Smahi@2522";
+
+// ===== OBJECTS =====
+Adafruit_ADXL345_Unified accel = Adafruit_ADXL345_Unified(12345);
+TinyGPSPlus gps;
+HardwareSerial gpsSerial(2);
+HardwareSerial gsmSerial(1);
+
+// ===== PINS =====
+#define BUZZER 25
+#define SOS_BTN 33
+
+// ===== THRESHOLDS =====
+float HIGH_THRESHOLD = 18.0;
+float LOW_THRESHOLD  = 4.0;
+
+bool accidentDetected = false;
+
+// 🔥 NEW: cooldown system
+unsigned long lastAlertTime = 0;
+const unsigned long ALERT_INTERVAL = 15000; // 15 sec
+
+// ===== PHONE NUMBERS =====
+String smsNumbers[] = {
+  "+917709317889",
+  "+919322238570",
+  "+918459509301",
+  "+917709940115"
+};
+
+String callNumber = "+919322238570";
+
+// ===== BLYNK EVENT =====
+void sendBlynkNotification(String msg) {
+  Blynk.logEvent("accident_alert", msg);
+}
+
+// ===== SOS FROM APP =====
+BLYNK_WRITE(V3) {
+  if (param.asInt() == 1) {
+    accidentAlert();
+  }
+}
+
+// ===== GET TIME =====
+String getTime() {
+  if (gps.time.isValid()) {
+    return String(gps.time.hour()) + ":" +
+           String(gps.time.minute()) + ":" +
+           String(gps.time.second());
+  }
+  return "Time NA";
+}
+
+// ===== SETUP =====
+void setup() {
+  Serial.begin(115200);
+
+  Wire.begin(21, 22);
+
+  if (!accel.begin()) {
+    Serial.println("ADXL345 NOT detected!");
+    while (1);
+  }
+
+  gpsSerial.begin(9600, SERIAL_8N1, 16, 17);
+  gsmSerial.begin(9600, SERIAL_8N1, 26, 27);
+
+  pinMode(BUZZER, OUTPUT);
+  pinMode(SOS_BTN, INPUT_PULLUP);
+
+  Blynk.begin(BLYNK_AUTH_TOKEN, ssid, pass);
+
+  Serial.println("System Ready...");
+}
+
+// ===== BUZZER =====
+void buzzerAlert() {
+  for (int i = 0; i < 5; i++) {
+    digitalWrite(BUZZER, HIGH);
+    delay(300);
+    digitalWrite(BUZZER, LOW);
+    delay(300);
+  }
+}
+
+// ===== GPS LOCATION =====
+String getLocation() {
+  unsigned long start = millis();
+
+  while (millis() - start < 5000) {
+    while (gpsSerial.available()) {
+      gps.encode(gpsSerial.read());
+    }
+  }
+
+  if (gps.location.isValid()) {
+    return "https://maps.google.com/?q=" +
+           String(gps.location.lat(), 6) + "," +
+           String(gps.location.lng(), 6);
+  }
+  return "Location Not Found";
+}
+
+// ===== SMS =====
+void sendSMS(String msg) {
+  for (int i = 0; i < 4; i++) {
+    gsmSerial.println("AT+CMGF=1");
+    delay(1000);
+
+    gsmSerial.print("AT+CMGS=\"");
+    gsmSerial.print(smsNumbers[i]);
+    gsmSerial.println("\"");
+
+    delay(1000);
+    gsmSerial.print(msg);
+
+    gsmSerial.write(26);
+    delay(5000);
+  }
+}
+
+// ===== CALL =====
+void makeCall() {
+  gsmSerial.print("ATD");
+  gsmSerial.print(callNumber);
+  gsmSerial.println(";");
+
+  delay(20000);
+  gsmSerial.println("ATH");
+}
+
+// ===== ALERT =====
+void accidentAlert() {
+
+  buzzerAlert();
+
+  String location = getLocation();
+  String timeNow = getTime();
+
+  String msg = "🚨 Accident Detected!\nTime: " + timeNow +
+               "\nLocation: " + location;
+
+  sendSMS(msg);
+  makeCall();
+
+  Blynk.virtualWrite(V1, "🚨 Accident Detected!");
+  Blynk.virtualWrite(V0, location);
+  Blynk.virtualWrite(V5, timeNow);
+
+  sendBlynkNotification(msg);
+
+  Serial.println(msg);
+}
+
+// ===== LOOP =====
+void loop() {
+
+  Blynk.run();
+
+  // Read GPS continuously
+  while (gpsSerial.available()) {
+    gps.encode(gpsSerial.read());
+  }
+
+  sensors_event_t event;
+  accel.getEvent(&event);
+
+  float totalAcc = sqrt(
+    event.acceleration.x * event.acceleration.x +
+    event.acceleration.y * event.acceleration.y +
+    event.acceleration.z * event.acceleration.z
+  );
+
+  Serial.print("Acc: ");
+  Serial.println(totalAcc);
+
+  Blynk.virtualWrite(V2, totalAcc);
+
+  // Speed
+  if (gps.location.isValid()) {
+    Blynk.virtualWrite(V4, gps.speed.kmph());
+  }
+
+  // ===== RESET WHEN STABLE =====
+  if (totalAcc > 8 && totalAcc < 12) {
+    accidentDetected = false;
+  }
+
+  // ===== DETECTION (FIXED) =====
+  if ((totalAcc > HIGH_THRESHOLD || totalAcc < LOW_THRESHOLD)
+      && !accidentDetected
+      && (millis() - lastAlertTime > ALERT_INTERVAL)) {
+
+    delay(2000);
+
+    accel.getEvent(&event);
+    float confirmAcc = sqrt(
+      event.acceleration.x * event.acceleration.x +
+      event.acceleration.y * event.acceleration.y +
+      event.acceleration.z * event.acceleration.z
+    );
+
+    if (confirmAcc > HIGH_THRESHOLD || confirmAcc < LOW_THRESHOLD) {
+      accidentDetected = true;
+      accidentAlert();
+
+      lastAlertTime = millis(); // 🔥 IMPORTANT
+    }
+  }
+
+  // ===== SOS BUTTON =====
+  if (digitalRead(SOS_BTN) == LOW) {
+    accidentAlert();
+    delay(2000);
+  }
+
+  delay(500);
+}
